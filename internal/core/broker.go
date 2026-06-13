@@ -1,4 +1,4 @@
-﻿package core
+package core
 
 import errs "github.com/SitnikovArtem06/message-broker/internal/errors"
 
@@ -6,19 +6,20 @@ type Broker struct {
 	Exchanges map[string]*Exchange
 }
 
-func (b *Broker) CreateExchange(name string) (*Exchange, error) {
-	if _, ok := b.Exchanges[name]; ok {
-		return nil, errs.ExchangeAlreadyExist
+func (b *Broker) CreateExchange(name string) *Exchange {
+	if exchange, ok := b.Exchanges[name]; ok {
+		return exchange
 	}
 
 	exchange := &Exchange{
-		Name:   name,
-		Queues: make(map[string]*Queue),
+		Name:        name,
+		Queues:      make(map[string]*Queue),
+		DeadLetters: &DeadLetterQueue{},
 	}
 
 	b.Exchanges[name] = exchange
 
-	return exchange, nil
+	return exchange
 
 }
 

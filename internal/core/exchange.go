@@ -5,36 +5,36 @@ import (
 )
 
 type Exchange struct {
-	Name   string
-	Queues map[string]*Queue
+	Name        string
+	Queues      map[string]*Queue
+	DeadLetters *DeadLetterQueue
 }
 
-
-func (e *Exchange) RegisterQueue(name string,IsDurable bool, IsAutoDelete bool, filters []RoutingFilter) (*Queue, error){
-	if queue,ok := e.Queues[name]; ok{
-		if queue.IsDurable == IsDurable && queue.IsAutoDelete == IsAutoDelete && equalFilters(queue.Filters, filters){
+func (e *Exchange) RegisterQueue(name string, IsDurable bool, IsAutoDelete bool, filters []RoutingFilter) (*Queue, error) {
+	if queue, ok := e.Queues[name]; ok {
+		if queue.IsDurable == IsDurable && queue.IsAutoDelete == IsAutoDelete && equalFilters(queue.Filters, filters) {
 			return queue, nil
 		}
 		return nil, errs.QueueAlreadyExist
 	}
 
-	if IsDurable && IsAutoDelete{
+	if IsDurable && IsAutoDelete {
 		return nil, errs.QueueFlagsConflict
 	}
 
-	if !validFilters(filters){
+	if !validFilters(filters) {
 		return nil, errs.FiltersIncorrect
 	}
 
-	queue := &Queue{Name: name, IsDurable: IsDurable, IsAutoDelete: IsAutoDelete, Filters: filters}
+	queue := NewQueue(name, IsDurable, IsAutoDelete, filters)
 
 	e.Queues[name] = queue
 
 	return queue, nil
 }
 
-func (e *Exchange) DeleteQueue(name string) error{
-	if _,ok := e.Queues[name];!ok{
+func (e *Exchange) DeleteQueue(name string) error {
+	if _, ok := e.Queues[name]; !ok {
 		return errs.QueueNotFound
 	}
 
@@ -42,24 +42,24 @@ func (e *Exchange) DeleteQueue(name string) error{
 	return nil
 }
 
-func validFilters(filters []RoutingFilter) bool{
-	for _,v := range filters{
-		if !v.IsValid(){
+func validFilters(filters []RoutingFilter) bool {
+	for _, v := range filters {
+		if !v.IsValid() {
 			return false
 		}
 	}
 	return true
 }
 
-func (e *Exchange) Publish(routingKey string, payload []byte) error{
+func (e *Exchange) Publish(routingKey string, payload []byte) error {
 	key := RoutingKey(routingKey)
-	if !key.IsValid(){
+	if !key.IsValid() {
 		return errs.InvalidRoutingKey
 	}
 
 	msg := Message{RoutingKey: key, Payload: payload}
-	for _,q := range e.Queues{
-		if q.MatchFilters(key){
+	for _, q := range e.Queues {
+		if q.MatchFilters(key) {
 			q.Append(msg)
 		}
 	}
@@ -67,38 +67,97 @@ func (e *Exchange) Publish(routingKey string, payload []byte) error{
 	return nil
 }
 
-func (e *Exchange) Fetch(queueName string) ([]byte, error){
-	queue,ok := e.Queues[queueName]; 
-	if !ok{
-		return nil, errs.QueueNotFound
+func (e *Exchange) Fetch(queueName, consumerID string) (Delivery, error) {
+	queue, ok := e.Queues[queueName]
+	if !ok {
+		return Delivery{}, errs.QueueNotFound
 	}
-	
-	if msg, err := queue.Fetch(); err != nil{
-		return nil,err
-	}else{
-		return msg.Payload, nil
+
+	if delivery, err := queue.Fetch(consumerID); err != nil {
+		return Delivery{}, err
+	} else {
+		return delivery, nil
 	}
 
 }
 
-func equalFilters(a,b []RoutingFilter) bool{
-	if len(a)!=len(b){
+func (e *Exchange) Ack(queueName, deliveryID, consumerID string) error {
+	queue, ok := e.Queues[queueName]
+	if !ok {
+		return errs.QueueNotFound
+	}
+
+	if err := queue.Ack(deliveryID, consumerID); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (e *Exchange) NAck(queueName, deliveryID, consumerID string) error {
+	queue, ok := e.Queues[queueName]
+	if !ok {
+		return errs.QueueNotFound
+	}
+
+	delivery, shouldDeadLetter, err := queue.Reject(deliveryID, consumerID)
+	if err != nil {
+		return err
+	}
+
+	if shouldDeadLetter {
+		e.DeadLetters.Append(DeadLetter{
+			Message:     delivery.Message,
+			SourceQueue: queueName,
+			Reason:      "nack without another consumer",
+			Attempts:    delivery.Attempts,
+		})
+	}
+
+	return nil
+}
+
+func (e *Exchange) AddConsumer(queueName, consumerID string) error {
+	queue, ok := e.Queues[queueName]
+	if !ok {
+		return errs.QueueNotFound
+	}
+
+	queue.AddConsumer(consumerID)
+	return nil
+}
+
+func (e *Exchange) DisconnectConsumer(queueName, consumerID string) error {
+	queue, ok := e.Queues[queueName]
+	if !ok {
+		return errs.QueueNotFound
+	}
+
+	queue.DisconnectConsumer(consumerID)
+
+	if queue.IsAutoDelete && !queue.HasConsumers() {
+		delete(e.Queues, queueName)
+	}
+	return nil
+}
+
+func equalFilters(a, b []RoutingFilter) bool {
+	if len(a) != len(b) {
 		return false
 	}
 	mapA := make(map[RoutingFilter]struct{})
 	mapB := make(map[RoutingFilter]struct{})
 
-	for i:=0;i<len(a);i++{
-		mapA[a[i]]=struct{}{}
-		mapB[b[i]]=struct{}{}
+	for i := 0; i < len(a); i++ {
+		mapA[a[i]] = struct{}{}
+		mapB[b[i]] = struct{}{}
 	}
 
-	for v := range mapA{
-		if _,ok := mapB[v];!ok{
+	for v := range mapA {
+		if _, ok := mapB[v]; !ok {
 			return false
 		}
 	}
 
 	return true
 }
-
