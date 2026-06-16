@@ -1,13 +1,12 @@
-﻿package core
+package core
 
 import (
 	errs "github.com/SitnikovArtem06/message-broker/internal/errors"
 )
 
 type Exchange struct {
-	Name        string
-	Queues      map[string]*Queue
-	DeadLetters *DeadLetterQueue
+	Name   string
+	Queues map[string]*Queue
 }
 
 func (e *Exchange) RegisterQueue(name string, IsDurable bool, IsAutoDelete bool, filters []RoutingFilter) (*Queue, error) {
@@ -42,6 +41,15 @@ func (e *Exchange) DeleteQueue(name string) error {
 	return nil
 }
 
+func (e *Exchange) GetQueue(name string) (*Queue, error) {
+	queue, ok := e.Queues[name]
+	if !ok {
+		return nil, errs.QueueNotFound
+	}
+
+	return queue, nil
+}
+
 func validFilters(filters []RoutingFilter) bool {
 	for _, v := range filters {
 		if !v.IsValid() {
@@ -51,20 +59,22 @@ func validFilters(filters []RoutingFilter) bool {
 	return true
 }
 
-func (e *Exchange) Publish(routingKey string, payload []byte) error {
+func (e *Exchange) Publish(routingKey string, payload []byte) ([]PublishedDelivery, error) {
 	key := RoutingKey(routingKey)
 	if !key.IsValid() {
-		return errs.InvalidRoutingKey
+		return nil, errs.InvalidRoutingKey
 	}
 
+	var published []PublishedDelivery
 	msg := Message{RoutingKey: key, Payload: payload}
 	for _, q := range e.Queues {
 		if q.MatchFilters(key) {
-			q.Append(msg)
+			delivery := q.Append(msg)
+			published = append(published, PublishedDelivery{QueueName: q.Name, Queue: q, Delivery: delivery})
 		}
 	}
 
-	return nil
+	return published, nil
 }
 
 func (e *Exchange) Fetch(queueName, consumerID string) (Delivery, error) {
@@ -94,27 +104,35 @@ func (e *Exchange) Ack(queueName, deliveryID, consumerID string) error {
 	return nil
 }
 
-func (e *Exchange) NAck(queueName, deliveryID, consumerID string) error {
+type NAckResult struct {
+	Delivery   Delivery
+	DeadLetter DeadLetter
+	IsDead     bool
+}
+
+func (e *Exchange) NAck(queueName, deliveryID, consumerID string) (NAckResult, error) {
 	queue, ok := e.Queues[queueName]
 	if !ok {
-		return errs.QueueNotFound
+		return NAckResult{}, errs.QueueNotFound
 	}
 
 	delivery, shouldDeadLetter, err := queue.Reject(deliveryID, consumerID)
 	if err != nil {
-		return err
+		return NAckResult{}, err
 	}
 
+	var deadLetter DeadLetter
+
 	if shouldDeadLetter {
-		e.DeadLetters.Append(DeadLetter{
+		deadLetter = DeadLetter{
 			Message:     delivery.Message,
 			SourceQueue: queueName,
 			Reason:      "nack without another consumer",
 			Attempts:    delivery.Attempts,
-		})
+		}
 	}
 
-	return nil
+	return NAckResult{Delivery: delivery, DeadLetter: deadLetter, IsDead: shouldDeadLetter}, nil
 }
 
 func (e *Exchange) AddConsumer(queueName, consumerID string) error {
@@ -127,18 +145,18 @@ func (e *Exchange) AddConsumer(queueName, consumerID string) error {
 	return nil
 }
 
-func (e *Exchange) DisconnectConsumer(queueName, consumerID string) error {
+func (e *Exchange) DisconnectConsumer(queueName, consumerID string) ([]Delivery, error) {
 	queue, ok := e.Queues[queueName]
 	if !ok {
-		return errs.QueueNotFound
+		return nil, errs.QueueNotFound
 	}
 
-	queue.DisconnectConsumer(consumerID)
+	returned := queue.DisconnectConsumer(consumerID)
 
 	if queue.IsAutoDelete && !queue.HasConsumers() {
 		delete(e.Queues, queueName)
 	}
-	return nil
+	return returned, nil
 }
 
 func equalFilters(a, b []RoutingFilter) bool {

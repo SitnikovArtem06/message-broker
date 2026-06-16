@@ -1,32 +1,32 @@
 package core
 
 import (
-	"strings"
 	"regexp"
+	"strings"
 )
 
 type RoutingFilter string
 
 var regexFilter = regexp.MustCompile(`^([A-Za-z0-9_-]+|\*)(\.([A-Za-z0-9_-]+|\*))*$`)
 
-func (r RoutingFilter) IsValid() bool{
+func (r RoutingFilter) IsValid() bool {
 	return regexFilter.Match([]byte(r))
 }
 
 func (r RoutingFilter) Match(key RoutingKey) bool {
 
-	splitFilter := strings.Split(string(r),".")
-	splitKey := strings.Split(string(key),".")
+	splitFilter := strings.Split(string(r), ".")
+	splitKey := strings.Split(string(key), ".")
 
-	if len(splitFilter) != len(splitKey){
+	if len(splitFilter) != len(splitKey) {
 		return false
 	}
 
-	for i,v := range splitFilter{
-		if v == "*"{
+	for i, v := range splitFilter {
+		if v == "*" {
 			continue
 		}
-		if v != splitKey[i]{
+		if v != splitKey[i] {
 			return false
 		}
 	}

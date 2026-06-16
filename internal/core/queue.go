@@ -52,13 +52,22 @@ func (q *Queue) Fetch(consumerID string) (Delivery, error) {
 	return delivery, nil
 }
 
-func (q *Queue) Append(msg Message) {
+func (q *Queue) Append(msg Message) Delivery {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	id := uuid.New().String()
 
 	delivery := Delivery{ID: id, Message: msg}
+	q.Ready = append(q.Ready, delivery)
+	return delivery
+}
+
+func (q *Queue) RestoreReady(delivery Delivery) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	delivery.ConsumerID = ""
 	q.Ready = append(q.Ready, delivery)
 }
 
@@ -99,25 +108,29 @@ func (q *Queue) Reject(deliveryID string, consumerID string) (Delivery, bool, er
 		if consumerID != delivery.ConsumerID {
 			delivery.ConsumerID = ""
 			q.Ready = append(q.Ready, delivery)
-			return Delivery{}, false, nil
+			return delivery, false, nil
 		}
 	}
 
 	return delivery, true, nil
 }
 
-func (q *Queue) DisconnectConsumer(consumerID string) {
+func (q *Queue) DisconnectConsumer(consumerID string) []Delivery {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	var returned []Delivery
 	for _, delivery := range q.InFlight {
 		if delivery.ConsumerID == consumerID {
 			delete(q.InFlight, delivery.ID)
 			delivery.ConsumerID = ""
 			q.Ready = append(q.Ready, delivery)
+			returned = append(returned, delivery)
 		}
 	}
 	delete(q.Consumers, consumerID)
+
+	return returned
 }
 
 func (q *Queue) AddConsumer(consumerID string) {

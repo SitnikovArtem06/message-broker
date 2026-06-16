@@ -1,4 +1,4 @@
-﻿package core
+package core
 
 type Message struct {
 	//ID         string

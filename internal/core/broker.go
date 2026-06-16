@@ -12,15 +12,23 @@ func (b *Broker) CreateExchange(name string) *Exchange {
 	}
 
 	exchange := &Exchange{
-		Name:        name,
-		Queues:      make(map[string]*Queue),
-		DeadLetters: &DeadLetterQueue{},
+		Name:   name,
+		Queues: make(map[string]*Queue),
 	}
 
 	b.Exchanges[name] = exchange
 
 	return exchange
 
+}
+
+func (b *Broker) GetExchange(name string) (*Exchange, error) {
+	exchange, ok := b.Exchanges[name]
+	if !ok {
+		return nil, errs.ExchangeNotFound
+	}
+
+	return exchange, nil
 }
 
 func (b *Broker) DeleteExchange(name string) error {

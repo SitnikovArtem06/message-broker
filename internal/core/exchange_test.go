@@ -35,7 +35,7 @@ func TestDeliveryPublishFetchAck(t *testing.T) {
 	if err := exchange.AddConsumer("users", "consumer-1"); err != nil {
 		t.Fatalf("AddConsumer() error = %v", err)
 	}
-	if err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
+	if _, err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
 		t.Fatalf("Publish() error = %v", err)
 	}
 
@@ -62,7 +62,7 @@ func TestDeliveryFetchRequiresRegisteredConsumer(t *testing.T) {
 	exchange := newTestExchange(t)
 	registerTestQueue(t, exchange, "users", []RoutingFilter{"corp.users.*"})
 
-	if err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
+	if _, err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
 		t.Fatalf("Publish() error = %v", err)
 	}
 
@@ -82,7 +82,7 @@ func TestDeliveryAckRejectsAnotherConsumer(t *testing.T) {
 	if err := exchange.AddConsumer("users", "consumer-2"); err != nil {
 		t.Fatalf("AddConsumer(consumer-2) error = %v", err)
 	}
-	if err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
+	if _, err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
 		t.Fatalf("Publish() error = %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestDeliveryNAckRequeuesWhenAnotherConsumerExists(t *testing.T) {
 	if err := exchange.AddConsumer("users", "consumer-2"); err != nil {
 		t.Fatalf("AddConsumer(consumer-2) error = %v", err)
 	}
-	if err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
+	if _, err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
 		t.Fatalf("Publish() error = %v", err)
 	}
 
@@ -118,12 +118,13 @@ func TestDeliveryNAckRequeuesWhenAnotherConsumerExists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch() error = %v", err)
 	}
-	if err := exchange.NAck("users", delivery.ID, "consumer-1"); err != nil {
+	result, err := exchange.NAck("users", delivery.ID, "consumer-1")
+	if err != nil {
 		t.Fatalf("NAck() error = %v", err)
 	}
 
-	if len(exchange.DeadLetters.Items) != 0 {
-		t.Fatalf("dead-letter count = %d, want 0", len(exchange.DeadLetters.Items))
+	if result.IsDead {
+		t.Fatal("NAck() sent delivery to dead-letter, want requeue")
 	}
 	if len(queue.Ready) != 1 {
 		t.Fatalf("ready count = %d, want 1", len(queue.Ready))
@@ -145,7 +146,7 @@ func TestDeliveryNAckDeadLettersWithoutAnotherConsumer(t *testing.T) {
 	if err := exchange.AddConsumer("users", "consumer-1"); err != nil {
 		t.Fatalf("AddConsumer() error = %v", err)
 	}
-	if err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
+	if _, err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
 		t.Fatalf("Publish() error = %v", err)
 	}
 
@@ -153,7 +154,8 @@ func TestDeliveryNAckDeadLettersWithoutAnotherConsumer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch() error = %v", err)
 	}
-	if err := exchange.NAck("users", delivery.ID, "consumer-1"); err != nil {
+	result, err := exchange.NAck("users", delivery.ID, "consumer-1")
+	if err != nil {
 		t.Fatalf("NAck() error = %v", err)
 	}
 
@@ -163,11 +165,11 @@ func TestDeliveryNAckDeadLettersWithoutAnotherConsumer(t *testing.T) {
 	if len(queue.InFlight) != 0 {
 		t.Fatalf("in-flight count = %d, want 0", len(queue.InFlight))
 	}
-	if len(exchange.DeadLetters.Items) != 1 {
-		t.Fatalf("dead-letter count = %d, want 1", len(exchange.DeadLetters.Items))
+	if !result.IsDead {
+		t.Fatal("NAck() did not send delivery to dead-letter")
 	}
 
-	letter := exchange.DeadLetters.Items[0]
+	letter := result.DeadLetter
 	if letter.SourceQueue != "users" {
 		t.Fatalf("source queue = %q, want %q", letter.SourceQueue, "users")
 	}
@@ -183,14 +185,14 @@ func TestDeliveryDisconnectReturnsInFlightToReady(t *testing.T) {
 	if err := exchange.AddConsumer("users", "consumer-1"); err != nil {
 		t.Fatalf("AddConsumer(consumer-1) error = %v", err)
 	}
-	if err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
+	if _, err := exchange.Publish("corp.users.create", []byte("payload")); err != nil {
 		t.Fatalf("Publish() error = %v", err)
 	}
 	if _, err := exchange.Fetch("users", "consumer-1"); err != nil {
 		t.Fatalf("Fetch() error = %v", err)
 	}
 
-	if err := exchange.DisconnectConsumer("users", "consumer-1"); err != nil {
+	if _, err := exchange.DisconnectConsumer("users", "consumer-1"); err != nil {
 		t.Fatalf("DisconnectConsumer() error = %v", err)
 	}
 
@@ -212,7 +214,7 @@ func TestDeliveryAutoDeleteRemovesQueueAfterLastConsumerDisconnect(t *testing.T)
 		t.Fatalf("AddConsumer() error = %v", err)
 	}
 
-	if err := exchange.DisconnectConsumer("temp", "consumer-1"); err != nil {
+	if _, err := exchange.DisconnectConsumer("temp", "consumer-1"); err != nil {
 		t.Fatalf("DisconnectConsumer() error = %v", err)
 	}
 	if _, ok := exchange.Queues["temp"]; ok {
