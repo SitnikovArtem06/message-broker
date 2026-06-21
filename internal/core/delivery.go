@@ -11,5 +11,5 @@ type PublishedDelivery struct {
 	QueueName string
 	Queue     *Queue
 	Delivery  Delivery
-	Message 	Message
+	Message   Message
 }
