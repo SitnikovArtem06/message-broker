@@ -20,7 +20,7 @@ type BrokerHandler struct {
 	service *service.BrokerService
 }
 
-const TimeOutDisconnect = 5 * time.Millisecond
+const TimeOutDisconnect = 5 * time.Second
 
 func NewBrokerHandler(service *service.BrokerService) *BrokerHandler {
 	return &BrokerHandler{service: service}
