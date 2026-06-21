@@ -1,12 +1,26 @@
 package core
 
-import errs "github.com/SitnikovArtem06/message-broker/internal/errors"
+import (
+	"sync"
+
+	errs "github.com/SitnikovArtem06/message-broker/internal/errors"
+)
 
 type Broker struct {
+	mu        sync.RWMutex
 	Exchanges map[string]*Exchange
 }
 
+func NewBroker() *Broker {
+	return &Broker{
+		Exchanges: make(map[string]*Exchange),
+	}
+}
+
 func (b *Broker) CreateExchange(name string) *Exchange {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if exchange, ok := b.Exchanges[name]; ok {
 		return exchange
 	}
@@ -23,6 +37,9 @@ func (b *Broker) CreateExchange(name string) *Exchange {
 }
 
 func (b *Broker) GetExchange(name string) (*Exchange, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
 	exchange, ok := b.Exchanges[name]
 	if !ok {
 		return nil, errs.ExchangeNotFound
@@ -32,6 +49,9 @@ func (b *Broker) GetExchange(name string) (*Exchange, error) {
 }
 
 func (b *Broker) DeleteExchange(name string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if _, ok := b.Exchanges[name]; !ok {
 		return errs.ExchangeNotFound
 	}

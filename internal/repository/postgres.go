@@ -3,9 +3,10 @@ package repository
 import (
 	"context"
 	stdsql "database/sql"
+	"log/slog"
 
 	"github.com/SitnikovArtem06/message-broker/internal/core"
-	"github.com/SitnikovArtem06/message-broker/internal/storage"
+	errs "github.com/SitnikovArtem06/message-broker/internal/errors"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -18,10 +19,16 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
+func logStorageError(operation string, err error, attrs ...any) {
+	args := append([]any{"operation", operation, "err", err}, attrs...)
+	slog.Error("storage error", args...)
+}
+
 func (r *Repository) SaveExchange(ctx context.Context, exchangeName string) error {
 	sql := `INSERT INTO exchanges(name) VALUES($1) ON CONFLICT (name) DO NOTHING`
 
 	if _, err := r.db.Exec(ctx, sql, exchangeName); err != nil {
+		logStorageError("save_exchange", err, "exchange", exchangeName)
 		return err
 	}
 
@@ -32,6 +39,7 @@ func (r *Repository) DeleteExchange(ctx context.Context, exchangeName string) er
 	sql := `DELETE FROM exchanges WHERE name = $1`
 
 	if _, err := r.db.Exec(ctx, sql, exchangeName); err != nil {
+		logStorageError("delete_exchange", err, "exchange", exchangeName)
 		return err
 	}
 
@@ -66,6 +74,7 @@ func (r *Repository) SaveQueue(ctx context.Context, exchangeName string, queue *
 		queue.IsAutoDelete,
 		queue.MaxAttempts,
 	); err != nil {
+		logStorageError("save_queue", err, "exchange", exchangeName, "queue", queue.Name)
 		return err
 	}
 
@@ -84,13 +93,18 @@ func (r *Repository) SaveQueue(ctx context.Context, exchangeName string, queue *
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (r *Repository) DeleteQueue(ctx context.Context, exchangeName string, queueName string) error {
 	const sql = `DELETE FROM queues WHERE exchange_name = $1 AND name = $2`
 
 	if _, err := r.db.Exec(ctx, sql, exchangeName, queueName); err != nil {
+		logStorageError("delete_queue", err, "exchange", exchangeName, "queue", queueName)
 		return err
 	}
 
@@ -122,6 +136,7 @@ func (r *Repository) SaveReadyDelivery(ctx context.Context, exchangeName string,
 		delivery.Message.Payload,
 		delivery.Attempts,
 	); err != nil {
+		logStorageError("save_ready_delivery", err, "exchange", exchangeName, "queue", queueName, "delivery_id", delivery.ID)
 		return err
 	}
 
@@ -138,8 +153,13 @@ func (r *Repository) MarkInFlight(ctx context.Context, deliveryID string, consum
 		WHERE id = $1
 	`
 
-	if _, err := r.db.Exec(ctx, sql, deliveryID, consumerID, attempts); err != nil {
+	tag, err := r.db.Exec(ctx, sql, deliveryID, consumerID, attempts)
+	if err != nil {
+		logStorageError("mark_in_flight", err, "delivery_id", deliveryID, "consumer", consumerID, "attempts", attempts)
 		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return errs.DeliveryNotFound
 	}
 
 	return nil
@@ -155,6 +175,7 @@ func (r *Repository) MarkReady(ctx context.Context, deliveryID string) error {
 	`
 
 	if _, err := r.db.Exec(ctx, sql, deliveryID); err != nil {
+		logStorageError("mark_ready", err, "delivery_id", deliveryID)
 		return err
 	}
 
@@ -165,6 +186,7 @@ func (r *Repository) DeleteDelivery(ctx context.Context, deliveryID string) erro
 	const sql = `DELETE FROM deliveries WHERE id = $1`
 
 	if _, err := r.db.Exec(ctx, sql, deliveryID); err != nil {
+		logStorageError("delete_delivery", err, "delivery_id", deliveryID)
 		return err
 	}
 
@@ -196,30 +218,31 @@ func (r *Repository) SaveDeadLetter(ctx context.Context, exchangeName string, le
 		letter.Reason,
 		letter.Attempts,
 	); err != nil {
+		logStorageError("save_dead_letter", err, "exchange", exchangeName, "source_queue", letter.SourceQueue)
 		return err
 	}
 
 	return nil
 }
 
-func (r *Repository) LoadState(ctx context.Context) (storage.BrokerState, error) {
-	var state storage.BrokerState
+func (r *Repository) LoadState(ctx context.Context) (BrokerState, error) {
+	var state BrokerState
 
 	exchanges, err := r.loadExchanges(ctx)
 	if err != nil {
-		return storage.BrokerState{}, err
+		return BrokerState{}, err
 	}
 	state.Exchanges = exchanges
 
 	queues, err := r.loadQueues(ctx)
 	if err != nil {
-		return storage.BrokerState{}, err
+		return BrokerState{}, err
 	}
 	state.Queues = queues
 
 	deliveries, err := r.loadDeliveries(ctx)
 	if err != nil {
-		return storage.BrokerState{}, err
+		return BrokerState{}, err
 	}
 	state.Deliveries = deliveries
 
@@ -231,6 +254,7 @@ func (r *Repository) loadExchanges(ctx context.Context) ([]string, error) {
 
 	rows, err := r.db.Query(ctx, sql)
 	if err != nil {
+		logStorageError("load_exchanges", err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -244,7 +268,11 @@ func (r *Repository) loadExchanges(ctx context.Context) ([]string, error) {
 		exchanges = append(exchanges, name)
 	}
 
-	return exchanges, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return exchanges, nil
 }
 
 type queueKey struct {
@@ -252,7 +280,7 @@ type queueKey struct {
 	queueName    string
 }
 
-func (r *Repository) loadQueues(ctx context.Context) ([]storage.QueueState, error) {
+func (r *Repository) loadQueues(ctx context.Context) ([]QueueState, error) {
 	const sql = `
 		SELECT
 			q.exchange_name,
@@ -270,16 +298,17 @@ func (r *Repository) loadQueues(ctx context.Context) ([]storage.QueueState, erro
 
 	rows, err := r.db.Query(ctx, sql)
 	if err != nil {
+		logStorageError("load_queues", err)
 		return nil, err
 	}
 	defer rows.Close()
 
-	queuesByKey := make(map[queueKey]*storage.QueueState)
+	queuesByKey := make(map[queueKey]*QueueState)
 	var order []queueKey
 
 	for rows.Next() {
 		var (
-			queue  storage.QueueState
+			queue  QueueState
 			filter stdsql.NullString
 			key    queueKey
 		)
@@ -309,7 +338,7 @@ func (r *Repository) loadQueues(ctx context.Context) ([]storage.QueueState, erro
 		return nil, err
 	}
 
-	queues := make([]storage.QueueState, 0, len(order))
+	queues := make([]QueueState, 0, len(order))
 	for _, key := range order {
 		queues = append(queues, *queuesByKey[key])
 	}
@@ -317,7 +346,7 @@ func (r *Repository) loadQueues(ctx context.Context) ([]storage.QueueState, erro
 	return queues, nil
 }
 
-func (r *Repository) loadDeliveries(ctx context.Context) ([]storage.DeliveryState, error) {
+func (r *Repository) loadDeliveries(ctx context.Context) ([]DeliveryState, error) {
 	const sql = `
 		SELECT
 			exchange_name,
@@ -332,14 +361,15 @@ func (r *Repository) loadDeliveries(ctx context.Context) ([]storage.DeliveryStat
 
 	rows, err := r.db.Query(ctx, sql)
 	if err != nil {
+		logStorageError("load_deliveries", err)
 		return nil, err
 	}
 	defer rows.Close()
 
-	var deliveries []storage.DeliveryState
+	var deliveries []DeliveryState
 	for rows.Next() {
 		var (
-			delivery   storage.DeliveryState
+			delivery   DeliveryState
 			routingKey string
 		)
 		if err := rows.Scan(
@@ -356,5 +386,9 @@ func (r *Repository) loadDeliveries(ctx context.Context) ([]storage.DeliveryStat
 		deliveries = append(deliveries, delivery)
 	}
 
-	return deliveries, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return deliveries, nil
 }

@@ -1,4 +1,4 @@
-package storage
+package repository
 
 import "github.com/SitnikovArtem06/message-broker/internal/core"
 

@@ -2,9 +2,15 @@ package service
 
 import (
 	"context"
+	"errors"
+	"log/slog"
+	"time"
 
+	"github.com/SitnikovArtem06/message-broker/internal/config"
 	"github.com/SitnikovArtem06/message-broker/internal/core"
-	"github.com/SitnikovArtem06/message-broker/internal/storage"
+	errs "github.com/SitnikovArtem06/message-broker/internal/errors"
+	"github.com/SitnikovArtem06/message-broker/internal/repository"
+	"github.com/google/uuid"
 )
 
 type Repository interface {
@@ -17,19 +23,19 @@ type Repository interface {
 	MarkReady(ctx context.Context, deliveryID string) error
 	DeleteDelivery(ctx context.Context, deliveryID string) error
 	SaveDeadLetter(ctx context.Context, exchangeName string, letter core.DeadLetter) error
-	LoadState(ctx context.Context) (storage.BrokerState, error)
+	LoadState(ctx context.Context) (repository.BrokerState, error)
 }
 
 type BrokerService struct {
 	broker *core.Broker
 	repo   Repository
+	limits config.LimitsConfig
 }
 
-func NewBrokerService(broker *core.Broker, repo Repository) *BrokerService {
-	return &BrokerService{
-		broker: broker,
-		repo:   repo,
-	}
+const streamFetchTimeout = 30 * time.Second
+
+func NewBrokerService(broker *core.Broker, repo Repository, cfg config.LimitsConfig) *BrokerService {
+	return &BrokerService{broker: broker, repo: repo, limits: cfg}
 }
 
 func (s *BrokerService) CreateExchange(ctx context.Context, name string) (*core.Exchange, error) {
@@ -37,16 +43,29 @@ func (s *BrokerService) CreateExchange(ctx context.Context, name string) (*core.
 	if err := s.repo.SaveExchange(ctx, name); err != nil {
 		return nil, err
 	}
+	slog.Info("exchange created", "exchange", name)
 
 	return exchange, nil
 }
 
 func (s *BrokerService) DeleteExchange(ctx context.Context, name string) error {
+	exchange, err := s.broker.GetExchange(name)
+	if err != nil {
+		return err
+	}
+	if exchange.HasActiveConsumers() {
+		return errs.ExchangeHasConsumers
+	}
+
 	if err := s.broker.DeleteExchange(name); err != nil {
 		return err
 	}
 
-	return s.repo.DeleteExchange(ctx, name)
+	if err := s.repo.DeleteExchange(ctx, name); err != nil {
+		return err
+	}
+	slog.Info("exchange deleted", "exchange", name)
+	return nil
 }
 
 func (s *BrokerService) RegisterQueue(
@@ -55,6 +74,7 @@ func (s *BrokerService) RegisterQueue(
 	queueName string,
 	isDurable bool,
 	isAutoDelete bool,
+	maxAttempts int,
 	filters []core.RoutingFilter,
 ) (*core.Queue, error) {
 	exchange, err := s.broker.GetExchange(exchangeName)
@@ -62,7 +82,11 @@ func (s *BrokerService) RegisterQueue(
 		return nil, err
 	}
 
-	queue, err := exchange.RegisterQueue(queueName, isDurable, isAutoDelete, filters)
+	if len(filters) > s.limits.MaxQueueFilters {
+		return nil, errs.TooManyQueueFilters
+	}
+
+	queue, err := exchange.RegisterQueue(queueName, isDurable, isAutoDelete, maxAttempts, filters)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +96,7 @@ func (s *BrokerService) RegisterQueue(
 			return nil, err
 		}
 	}
+	slog.Info("queue created", "exchange", exchangeName, "queue", queueName, "durable", isDurable, "auto_delete", isAutoDelete, "max_attempts", maxAttempts)
 
 	return queue, nil
 }
@@ -92,29 +117,59 @@ func (s *BrokerService) DeleteQueue(ctx context.Context, exchangeName string, qu
 	}
 
 	if queue.IsDurable {
-		return s.repo.DeleteQueue(ctx, exchangeName, queueName)
+		if err := s.repo.DeleteQueue(ctx, exchangeName, queueName); err != nil {
+			return err
+		}
 	}
 
+	slog.Info("queue deleted", "exchange", exchangeName, "queue", queueName)
 	return nil
 }
 
-func (s *BrokerService) Publish(ctx context.Context, exchangeName string, routingKey string, payload []byte) error {
+func (s *BrokerService) Publish(
+	ctx context.Context,
+	exchangeName string,
+	routingKey string,
+	payload []byte,
+) error {
+	if len(payload) > s.limits.MaxMessageSize {
+		return errs.MessageTooLarge
+	}
+	if len(routingKey) > s.limits.MaxRoutingKeyLength {
+		return errs.RoutingKeyTooLong
+	}
+
 	exchange, err := s.broker.GetExchange(exchangeName)
 	if err != nil {
 		return err
 	}
 
-	published, err := exchange.Publish(routingKey, payload)
+	published, err := exchange.Route(routingKey, payload)
 	if err != nil {
 		return err
 	}
 
 	for _, item := range published {
 		if !item.Queue.IsDurable {
+			if err := exchange.EnqueueDelivery(item.QueueName, core.Delivery{
+				ID:      uuid.New().String(),
+				Message: item.Message,
+			}); err != nil {
+				return err
+			}
 			continue
 		}
 
-		if err := s.repo.SaveReadyDelivery(ctx, exchangeName, item.QueueName, item.Delivery); err != nil {
+		delivery := core.Delivery{
+			ID:      uuid.New().String(),
+			Message: item.Message,
+		}
+
+		if err := s.repo.SaveReadyDelivery(ctx, exchangeName, item.QueueName, delivery); err != nil {
+			return err
+		}
+
+		if err := exchange.EnqueueDelivery(item.QueueName, delivery); err != nil {
 			return err
 		}
 	}
@@ -122,7 +177,13 @@ func (s *BrokerService) Publish(ctx context.Context, exchangeName string, routin
 	return nil
 }
 
-func (s *BrokerService) Fetch(ctx context.Context, exchangeName string, queueName string, consumerID string) (core.Delivery, error) {
+func (s *BrokerService) BlockingFetch(
+	ctx context.Context,
+	exchangeName string,
+	queueName string,
+	consumerID string,
+	timeout time.Duration,
+) (core.Delivery, error) {
 	exchange, err := s.broker.GetExchange(exchangeName)
 	if err != nil {
 		return core.Delivery{}, err
@@ -133,21 +194,66 @@ func (s *BrokerService) Fetch(ctx context.Context, exchangeName string, queueNam
 		return core.Delivery{}, err
 	}
 
-	delivery, err := exchange.Fetch(queueName, consumerID)
-	if err != nil {
-		return core.Delivery{}, err
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+		defer timer.Stop()
 	}
 
-	if queue.IsDurable {
-		if err := s.repo.MarkInFlight(ctx, delivery.ID, consumerID, delivery.Attempts); err != nil {
+	for {
+		delivery, waitCh, err := exchange.FetchOrWait(queueName, consumerID, s.limits.MaxInFlight)
+		if err == nil {
+			if queue.IsDurable {
+				if err := s.repo.MarkInFlight(ctx, delivery.ID, consumerID, delivery.Attempts); err != nil {
+					slog.Error("critical delivery error", "operation", "mark_in_flight", "exchange", exchangeName, "queue", queueName, "consumer", consumerID, "delivery_id", delivery.ID, "err", err)
+					return core.Delivery{}, err
+				}
+			}
+			return delivery, nil
+		}
+
+		if !errors.Is(err, errs.QueueEmpty) {
+			return core.Delivery{}, err
+		}
+
+		if timeout <= 0 {
+			return core.Delivery{}, errs.QueueEmpty
+		}
+
+		select {
+		case <-ctx.Done():
+			return core.Delivery{}, ctx.Err()
+		case <-timer.C:
+			return core.Delivery{}, errs.QueueEmpty
+		case <-waitCh:
+		}
+	}
+}
+
+func (s *BrokerService) StreamFetch(
+	ctx context.Context,
+	exchangeName string,
+	queueName string,
+	consumerID string,
+) (core.Delivery, error) {
+	for {
+		delivery, err := s.BlockingFetch(ctx, exchangeName, queueName, consumerID, streamFetchTimeout)
+		if err == nil {
+			return delivery, nil
+		}
+		if !errors.Is(err, errs.QueueEmpty) {
 			return core.Delivery{}, err
 		}
 	}
-
-	return delivery, nil
 }
 
-func (s *BrokerService) Ack(ctx context.Context, exchangeName string, queueName string, deliveryID string, consumerID string) error {
+func (s *BrokerService) Ack(
+	ctx context.Context,
+	exchangeName string,
+	queueName string,
+	deliveryID string,
+	consumerID string,
+) error {
 	exchange, err := s.broker.GetExchange(exchangeName)
 	if err != nil {
 		return err
@@ -169,7 +275,13 @@ func (s *BrokerService) Ack(ctx context.Context, exchangeName string, queueName 
 	return nil
 }
 
-func (s *BrokerService) NAck(ctx context.Context, exchangeName string, queueName string, deliveryID string, consumerID string) error {
+func (s *BrokerService) NAck(
+	ctx context.Context,
+	exchangeName string,
+	queueName string,
+	deliveryID string,
+	consumerID string,
+) error {
 	exchange, err := s.broker.GetExchange(exchangeName)
 	if err != nil {
 		return err
@@ -188,21 +300,34 @@ func (s *BrokerService) NAck(ctx context.Context, exchangeName string, queueName
 	if result.IsDead {
 		if queue.IsDurable {
 			if err := s.repo.DeleteDelivery(ctx, result.Delivery.ID); err != nil {
+				slog.Error("critical delivery error", "operation", "delete_delivery_before_dead_letter", "exchange", exchangeName, "queue", queueName, "consumer", consumerID, "delivery_id", result.Delivery.ID, "err", err)
 				return err
 			}
 		}
 
-		return s.repo.SaveDeadLetter(ctx, exchangeName, result.DeadLetter)
+		if err := s.repo.SaveDeadLetter(ctx, exchangeName, result.DeadLetter); err != nil {
+			slog.Error("critical delivery error", "operation", "save_dead_letter", "exchange", exchangeName, "queue", queueName, "consumer", consumerID, "delivery_id", result.Delivery.ID, "err", err)
+			return err
+		}
+		return nil
 	}
 
 	if queue.IsDurable {
-		return s.repo.MarkReady(ctx, result.Delivery.ID)
+		if err := s.repo.MarkReady(ctx, result.Delivery.ID); err != nil {
+			slog.Error("critical delivery error", "operation", "mark_ready", "exchange", exchangeName, "queue", queueName, "consumer", consumerID, "delivery_id", result.Delivery.ID, "err", err)
+			return err
+		}
+		return nil
 	}
 
 	return nil
 }
 
-func (s *BrokerService) AddConsumer(_ context.Context, exchangeName string, queueName string, consumerID string) error {
+func (s *BrokerService) AddConsumer(_ context.Context,
+	exchangeName string,
+	queueName string,
+	consumerID string,
+) error {
 	exchange, err := s.broker.GetExchange(exchangeName)
 	if err != nil {
 		return err
@@ -233,6 +358,7 @@ func (s *BrokerService) DisconnectConsumer(ctx context.Context, exchangeName str
 
 	for _, delivery := range returned {
 		if err := s.repo.MarkReady(ctx, delivery.ID); err != nil {
+			slog.Error("critical delivery error", "operation", "mark_ready_on_disconnect", "exchange", exchangeName, "queue", queueName, "consumer", consumerID, "delivery_id", delivery.ID, "err", err)
 			return err
 		}
 	}
@@ -255,16 +381,16 @@ func (s *BrokerService) Restore(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		queue, err := exchange.RegisterQueue(
+		_, err = exchange.RegisterQueue(
 			queueState.Name,
 			queueState.IsDurable,
 			queueState.IsAutoDelete,
+			queueState.MaxAttempts,
 			queueState.Filters,
 		)
 		if err != nil {
 			return err
 		}
-		queue.MaxAttempts = queueState.MaxAttempts
 	}
 
 	for _, deliveryState := range state.Deliveries {

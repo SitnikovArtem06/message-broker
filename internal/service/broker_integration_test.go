@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SitnikovArtem06/message-broker/internal/config"
 	"github.com/SitnikovArtem06/message-broker/internal/core"
 	"github.com/SitnikovArtem06/message-broker/internal/repository"
 	"github.com/google/uuid"
@@ -34,7 +35,7 @@ func TestIntegrationRestoreReadyDurableDelivery(t *testing.T) {
 	if _, err := serviceBeforeRestart.CreateExchange(ctx, exchangeName); err != nil {
 		t.Fatalf("CreateExchange() error = %v", err)
 	}
-	if _, err := serviceBeforeRestart.RegisterQueue(ctx, exchangeName, queueName, true, false, []core.RoutingFilter{"corp.users.*"}); err != nil {
+	if _, err := serviceBeforeRestart.RegisterQueue(ctx, exchangeName, queueName, true, false, 0, []core.RoutingFilter{"corp.users.*"}); err != nil {
 		t.Fatalf("RegisterQueue() error = %v", err)
 	}
 	if err := serviceBeforeRestart.Publish(ctx, exchangeName, "corp.users.create", []byte("payload")); err != nil {
@@ -49,9 +50,9 @@ func TestIntegrationRestoreReadyDurableDelivery(t *testing.T) {
 		t.Fatalf("AddConsumer() error = %v", err)
 	}
 
-	delivery, err := serviceAfterRestart.Fetch(ctx, exchangeName, queueName, "consumer-1")
+	delivery, err := serviceAfterRestart.BlockingFetch(ctx, exchangeName, queueName, "consumer-1", time.Second)
 	if err != nil {
-		t.Fatalf("Fetch() error = %v", err)
+		t.Fatalf("BlockingFetch() error = %v", err)
 	}
 	if string(delivery.Message.Payload) != "payload" {
 		t.Fatalf("payload = %q, want %q", delivery.Message.Payload, "payload")
@@ -82,7 +83,7 @@ func TestIntegrationRestoreInFlightDurableDeliveryAsReady(t *testing.T) {
 	if _, err := serviceBeforeRestart.CreateExchange(ctx, exchangeName); err != nil {
 		t.Fatalf("CreateExchange() error = %v", err)
 	}
-	if _, err := serviceBeforeRestart.RegisterQueue(ctx, exchangeName, queueName, true, false, []core.RoutingFilter{"corp.users.*"}); err != nil {
+	if _, err := serviceBeforeRestart.RegisterQueue(ctx, exchangeName, queueName, true, false, 0, []core.RoutingFilter{"corp.users.*"}); err != nil {
 		t.Fatalf("RegisterQueue() error = %v", err)
 	}
 	if err := serviceBeforeRestart.AddConsumer(ctx, exchangeName, queueName, "consumer-1"); err != nil {
@@ -92,9 +93,9 @@ func TestIntegrationRestoreInFlightDurableDeliveryAsReady(t *testing.T) {
 		t.Fatalf("Publish() error = %v", err)
 	}
 
-	firstDelivery, err := serviceBeforeRestart.Fetch(ctx, exchangeName, queueName, "consumer-1")
+	firstDelivery, err := serviceBeforeRestart.BlockingFetch(ctx, exchangeName, queueName, "consumer-1", time.Second)
 	if err != nil {
-		t.Fatalf("first Fetch() error = %v", err)
+		t.Fatalf("first BlockingFetch() error = %v", err)
 	}
 
 	serviceAfterRestart := newIntegrationBrokerService(repo)
@@ -105,9 +106,9 @@ func TestIntegrationRestoreInFlightDurableDeliveryAsReady(t *testing.T) {
 		t.Fatalf("AddConsumer(consumer-2) error = %v", err)
 	}
 
-	redelivery, err := serviceAfterRestart.Fetch(ctx, exchangeName, queueName, "consumer-2")
+	redelivery, err := serviceAfterRestart.BlockingFetch(ctx, exchangeName, queueName, "consumer-2", time.Second)
 	if err != nil {
-		t.Fatalf("second Fetch() error = %v", err)
+		t.Fatalf("second BlockingFetch() error = %v", err)
 	}
 	if redelivery.ID != firstDelivery.ID {
 		t.Fatalf("redelivery id = %q, want %q", redelivery.ID, firstDelivery.ID)
@@ -121,6 +122,45 @@ func TestIntegrationRestoreInFlightDurableDeliveryAsReady(t *testing.T) {
 
 	if err := serviceAfterRestart.Ack(ctx, exchangeName, queueName, redelivery.ID, "consumer-2"); err != nil {
 		t.Fatalf("Ack() error = %v", err)
+	}
+}
+
+func TestIntegrationRestoreQueueMaxAttempts(t *testing.T) {
+	ctx := context.Background()
+	pool := integrationPool(t)
+	repo := repository.NewRepository(pool)
+
+	exchangeName := "it_restore_max_attempts_" + uuid.NewString()
+	queueName := "users"
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = repo.DeleteExchange(cleanupCtx, exchangeName)
+	})
+
+	serviceBeforeRestart := newIntegrationBrokerService(repo)
+	if _, err := serviceBeforeRestart.CreateExchange(ctx, exchangeName); err != nil {
+		t.Fatalf("CreateExchange() error = %v", err)
+	}
+	if _, err := serviceBeforeRestart.RegisterQueue(ctx, exchangeName, queueName, true, false, 3, []core.RoutingFilter{"corp.users.*"}); err != nil {
+		t.Fatalf("RegisterQueue() error = %v", err)
+	}
+
+	serviceAfterRestart := newIntegrationBrokerService(repo)
+	if err := serviceAfterRestart.Restore(ctx); err != nil {
+		t.Fatalf("Restore() error = %v", err)
+	}
+
+	exchange, err := serviceAfterRestart.broker.GetExchange(exchangeName)
+	if err != nil {
+		t.Fatalf("GetExchange() error = %v", err)
+	}
+	queue, err := exchange.GetQueue(queueName)
+	if err != nil {
+		t.Fatalf("GetQueue() error = %v", err)
+	}
+	if queue.MaxAttempts != 3 {
+		t.Fatalf("MaxAttempts = %d, want 3", queue.MaxAttempts)
 	}
 }
 
@@ -202,5 +242,10 @@ func applyIntegrationMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 }
 
 func newIntegrationBrokerService(repo Repository) *BrokerService {
-	return NewBrokerService(&core.Broker{Exchanges: make(map[string]*core.Exchange)}, repo)
+	return NewBrokerService(core.NewBroker(), repo, config.LimitsConfig{
+		MaxMessageSize:      1024 * 1024,
+		MaxRoutingKeyLength: 255,
+		MaxQueueFilters:     32,
+		MaxInFlight:         32,
+	})
 }

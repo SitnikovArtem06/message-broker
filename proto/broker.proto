@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package broker;
+
+option go_package = "github.com/SitnikovArtem06/message-broker/proto;brokerpb";
+
+service BrokerService{
+    rpc CreateExchange(CreateExchangeRequest) returns (CreateExchangeResponse);
+    rpc DeleteExchange(DeleteExchangeRequest) returns (DeleteExchangeResponse);
+    rpc RegisterQueue(RegisterQueueRequest) returns (RegisterQueueResponse);
+    rpc DeleteQueue(DeleteQueueRequest) returns (DeleteQueueResponse);
+    rpc Publish(PublishRequest) returns (PublishResponse);
+    rpc Fetch(FetchRequest) returns (FetchResponse);
+    rpc StreamFetch(SFetchRequest) returns (stream SFetchResponse);
+    rpc Ack(AckRequest) returns (AckResponse);
+    rpc Nack(NackRequest) returns (NackResponse);
+    rpc AddConsumer(AddConsumerRequest) returns (AddConsumerResponse);
+    rpc DisconnectConsumer(DisconnectConsumerRequest) returns (DisconnectConsumerResponse);
+}
+
+message CreateExchangeRequest{
+    string name = 1;
+}
+
+message CreateExchangeResponse{
+    string name = 1;
+}
+
+message DeleteExchangeRequest{
+    string name = 1;
+}
+
+message DeleteExchangeResponse{}
+
+message RegisterQueueRequest{
+    string exchange_name = 1;
+    string queue_name = 2;
+    bool durable = 3;
+    bool auto_delete = 4;
+    repeated string filters = 5;
+    int32 max_attempts = 6;
+}
+
+message RegisterQueueResponse{
+    string exchange_name = 1;
+    string queue_name = 2;
+}
+
+message DeleteQueueRequest{
+    string exchange_name = 1;
+    string queue_name = 2;
+}
+
+message DeleteQueueResponse{
+}
+
+message PublishRequest{
+    string exchange_name = 1;
+    string routing_key = 2;
+    bytes payload = 3;
+}
+
+message PublishResponse{
+}
+
+message FetchRequest{
+    string exchange_name = 1;
+    string queue_name = 2;
+    string consumer_id = 3;
+    int64 timeout_ms = 4;
+}
+
+message DeliveryMessage{
+    string delivery_id = 1;
+    string routing_key = 2;
+    bytes payload = 3;
+    int32 attempts = 4;
+}
+
+message FetchResponse{
+    DeliveryMessage delivery = 1;
+}
+
+message SFetchRequest{
+    string exchange_name = 1;
+    string queue_name = 2;
+    string consumer_id = 3;
+}
+
+message SFetchResponse{
+    DeliveryMessage delivery = 1;
+}
+
+message AckRequest{
+    string exchange_name = 1;
+    string queue_name = 2;
+    string delivery_id = 3;
+    string consumer_id = 4;
+}
+
+message AckResponse{}
+
+message NackRequest{
+    string exchange_name = 1;
+    string queue_name = 2;
+    string delivery_id = 3;
+    string consumer_id = 4;
+}
+
+message NackResponse{}
+
+message AddConsumerRequest {
+  string exchange_name = 1;
+  string queue_name = 2;
+  string consumer_id = 3;
+}
+
+message AddConsumerResponse {}
+
+message DisconnectConsumerRequest {
+  string exchange_name = 1;
+  string queue_name = 2;
+  string consumer_id = 3;
+}
+
+message DisconnectConsumerResponse {}

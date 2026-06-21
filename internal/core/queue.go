@@ -18,38 +18,20 @@ type Queue struct {
 	Ready        []Delivery
 	InFlight     map[string]Delivery
 	Consumers    map[string]struct{}
+	readyNotify  chan struct{}
 }
 
-func NewQueue(name string, isDurable bool, isAutoDelete bool, filters []RoutingFilter) *Queue {
+func NewQueue(name string, isDurable bool, isAutoDelete bool, maxAttempts int, filters []RoutingFilter) *Queue {
 	return &Queue{
 		Name:         name,
 		Filters:      filters,
 		IsDurable:    isDurable,
 		IsAutoDelete: isAutoDelete,
+		MaxAttempts:  maxAttempts,
 		InFlight:     make(map[string]Delivery),
 		Consumers:    make(map[string]struct{}),
+		readyNotify:  make(chan struct{}),
 	}
-}
-
-func (q *Queue) Fetch(consumerID string) (Delivery, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	if _, ok := q.Consumers[consumerID]; !ok {
-		return Delivery{}, errs.ConsumerNotFound
-	}
-
-	if len(q.Ready) == 0 {
-		return Delivery{}, errs.QueueEmpty
-	}
-
-	delivery := q.Ready[0]
-	delivery.Attempts++
-	delivery.ConsumerID = consumerID
-
-	q.InFlight[delivery.ID] = delivery
-	q.Ready = slices.Delete(q.Ready, 0, 1)
-	return delivery, nil
 }
 
 func (q *Queue) Append(msg Message) Delivery {
@@ -60,6 +42,7 @@ func (q *Queue) Append(msg Message) Delivery {
 
 	delivery := Delivery{ID: id, Message: msg}
 	q.Ready = append(q.Ready, delivery)
+	q.notifyReadyLocked()
 	return delivery
 }
 
@@ -69,6 +52,7 @@ func (q *Queue) RestoreReady(delivery Delivery) {
 
 	delivery.ConsumerID = ""
 	q.Ready = append(q.Ready, delivery)
+	q.notifyReadyLocked()
 }
 
 func (q *Queue) Ack(deliveryID string, consumerID string) error {
@@ -108,6 +92,7 @@ func (q *Queue) Reject(deliveryID string, consumerID string) (Delivery, bool, er
 		if consumerID != delivery.ConsumerID {
 			delivery.ConsumerID = ""
 			q.Ready = append(q.Ready, delivery)
+			q.notifyReadyLocked()
 			return delivery, false, nil
 		}
 	}
@@ -128,6 +113,9 @@ func (q *Queue) DisconnectConsumer(consumerID string) []Delivery {
 			returned = append(returned, delivery)
 		}
 	}
+	if len(returned) > 0 {
+		q.notifyReadyLocked()
+	}
 	delete(q.Consumers, consumerID)
 
 	return returned
@@ -139,36 +127,55 @@ func (q *Queue) AddConsumer(consumerID string) {
 
 	q.Consumers[consumerID] = struct{}{}
 }
-
-func (q *Queue) RemoveConsumer(consumerID string) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	if _, ok := q.Consumers[consumerID]; !ok {
-		return errs.ConsumerNotFound
-	}
-
-	delete(q.Consumers, consumerID)
-	return nil
-}
-
 func (q *Queue) HasConsumers() bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	return len(q.Consumers) != 0
 }
-
-func (q *Queue) HasOtherConsumers(consumerID string) bool {
+func (q *Queue) EnqueueDelivery(delivery Delivery) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	for k := range q.Consumers {
-		if k != consumerID {
-			return true
+	q.Ready = append(q.Ready, delivery)
+	q.notifyReadyLocked()
+}
+
+func (q *Queue) FetchOrWait(consumerID string, maxInFlight int) (Delivery, <-chan struct{}, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if _, ok := q.Consumers[consumerID]; !ok {
+		return Delivery{}, nil, errs.ConsumerNotFound
+	}
+
+	if maxInFlight > 0 && q.consumerInFlightCountLocked(consumerID) >= maxInFlight {
+		return Delivery{}, nil, errs.TooManyInFlight
+	}
+
+	if len(q.Ready) == 0 {
+		return Delivery{}, q.readyNotify, errs.QueueEmpty
+	}
+
+	delivery := q.Ready[0]
+	delivery.Attempts++
+	delivery.ConsumerID = consumerID
+
+	q.InFlight[delivery.ID] = delivery
+	q.Ready = slices.Delete(q.Ready, 0, 1)
+
+	return delivery, nil, nil
+}
+
+func (q *Queue) consumerInFlightCountLocked(consumerID string) int {
+	count := 0
+	for _, delivery := range q.InFlight {
+		if delivery.ConsumerID == consumerID {
+			count++
 		}
 	}
-	return false
+
+	return count
 }
 
 func (q *Queue) MatchFilters(key RoutingKey) bool {
@@ -178,4 +185,9 @@ func (q *Queue) MatchFilters(key RoutingKey) bool {
 		}
 	}
 	return false
+}
+
+func (q *Queue) notifyReadyLocked() {
+	close(q.readyNotify)
+	q.readyNotify = make(chan struct{})
 }
